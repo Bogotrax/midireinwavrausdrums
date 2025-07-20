@@ -1,0 +1,246 @@
+import mido
+import soundfile as sf
+import numpy as np
+import os
+import sys
+import glob
+import re
+
+# === Konfiguration ===
+SAMPLE_RATE = 44100  # Output-WAV Sample Rate
+
+# Gängige Drum-Mappings basierend auf Dateinamen
+DRUM_MAPPINGS = {
+    # Bass Drums
+    'kick': 36, 'bass': 36, 'bd': 36, 'bassdrum': 36,
+    # Snares
+    'snare': 38, 'sd': 38, 'snaredrum': 38,
+    # HiHats
+    'hihat': 42, 'hh': 42, 'closed': 42, 'open': 46, 'oh': 46,
+    # Toms
+    'tom': 45, 'tom1': 45, 'tom2': 47, 'tom3': 50, 'tom4': 41,
+    # Cymbals
+    'crash': 49, 'ride': 51, 'cymbal': 49,
+    # Percussion
+    'clap': 39, 'rim': 37, 'rimshot': 37, 'shaker': 70, 'tamb': 54,
+    # Weitere Drums
+    'floor': 43, 'floortom': 43, 'low': 43, 'high': 50
+}
+
+# === Automatische Sample-Zuordnung ===
+def auto_map_samples(sample_dir):
+    """Ordnet WAV-Dateien automatisch MIDI-Noten zu"""
+    note_to_sample = {}
+    used_notes = set()
+    
+    # Alle WAV-Dateien im Ordner finden
+    wav_files = glob.glob(os.path.join(sample_dir, "*.wav"))
+    
+    if not wav_files:
+        print(f"[ERROR] Keine WAV-Dateien in {sample_dir} gefunden!")
+        return {}
+    
+    print(f"[INFO] Gefundene Samples: {len(wav_files)}")
+    
+    for wav_file in wav_files:
+        filename = os.path.basename(wav_file).lower()
+        filename_no_ext = os.path.splitext(filename)[0]
+        
+        # MIDI-Note basierend auf Dateinamen finden
+        midi_note = None
+        
+        # Direkte Suche nach bekannten Drum-Namen
+        for drum_name, note in DRUM_MAPPINGS.items():
+            if drum_name in filename_no_ext:
+                midi_note = note
+                break
+        
+        # Falls keine direkte Zuordnung, versuche Nummer am Ende
+        if midi_note is None:
+            # Suche nach Nummer am Ende (z.B. "kick1" -> Note 36)
+            match = re.search(r'(\d+)$', filename_no_ext)
+            if match:
+                number = int(match.group(1))
+                # Einfache Zuordnung: 1-10 = Bass, 11-20 = Snare, etc.
+                if 1 <= number <= 10:
+                    midi_note = 36  # Bass Drum
+                elif 11 <= number <= 20:
+                    midi_note = 38  # Snare
+                elif 21 <= number <= 30:
+                    midi_note = 42  # HiHat
+                else:
+                    midi_note = 35 + (number % 20)  # Andere Drums
+        
+        # Falls immer noch keine Zuordnung, verwende Standard-Mapping
+        if midi_note is None:
+            # Verwende die ersten verfügbaren Noten ab 36
+            for note in range(36, 88):
+                if note not in used_notes:
+                    midi_note = note
+                    break
+        
+        if midi_note is not None and midi_note not in used_notes:
+            note_to_sample[midi_note] = wav_file
+            used_notes.add(midi_note)
+            print(f"[INFO] {filename} -> MIDI Note {midi_note}")
+        else:
+            print(f"[WARN] Überspringe {filename} (Note {midi_note} bereits belegt)")
+    
+    return note_to_sample
+
+# === Lade ein einzelnes Sample ===
+def load_sample(path):
+    if not os.path.exists(path):
+        print(f"[WARN] Sample fehlt: {path}")
+        return None
+    
+    try:
+        data, rate = sf.read(path)
+        
+        # Sample-Rate-Konvertierung falls nötig
+        if rate != SAMPLE_RATE:
+            print(f"[INFO] Konvertiere Sample-Rate von {rate} auf {SAMPLE_RATE}")
+            # Einfache Resampling-Methode (für bessere Qualität könnte man librosa verwenden)
+            ratio = SAMPLE_RATE / rate
+            new_length = int(len(data) * ratio)
+            indices = np.arange(new_length) / ratio
+            data = np.interp(indices, np.arange(len(data)), data)
+        
+        # Falls mono → in stereo konvertieren
+        if data.ndim == 1:
+            data = np.stack([data, data], axis=1)
+        
+        return data
+    except Exception as e:
+        print(f"[ERROR] Fehler beim Laden von {path}: {e}")
+        return None
+
+# === Hauptfunktion ===
+def midi_to_audio(midi_file, sample_dir, output_wav):
+    print(f"[INFO] Lade MIDI: {midi_file}")
+    
+    if not os.path.exists(midi_file):
+        print(f"[ERROR] MIDI-Datei nicht gefunden: {midi_file}")
+        return False
+    
+    mid = mido.MidiFile(midi_file)
+    total_duration = mid.length
+    total_samples = int(SAMPLE_RATE * total_duration) + SAMPLE_RATE
+
+    print(f"[INFO] Lade Samples aus: {sample_dir}")
+    note_to_sample = auto_map_samples(sample_dir)
+    
+    if not note_to_sample:
+        print("[ERROR] Keine Samples gefunden!")
+        return False
+    
+    # Samples laden
+    samples = {}
+    for note, wav_path in note_to_sample.items():
+        sample = load_sample(wav_path)
+        if sample is not None:
+            samples[note] = sample
+            print(f"[INFO] Geladen: {os.path.basename(wav_path)} -> Note {note}")
+        else:
+            print(f"[WARN] Konnte Sample für Note {note} nicht laden")
+
+    if not samples:
+        print("[ERROR] Keine Samples konnten geladen werden!")
+        return False
+
+    # Leeres Audio (Stereo)
+    audio = np.zeros((total_samples, 2), dtype=np.float32)
+
+    # Sequenzieren
+    time = 0.0
+    events_processed = 0
+    
+    for msg in mid:
+        time += msg.time
+        if msg.type == 'note_on' and msg.velocity > 0 and msg.note in samples:
+            sample = samples[msg.note]
+            start = int(time * SAMPLE_RATE)
+            end = start + len(sample)
+            
+            if end > len(audio):
+                continue  # Sample würde über das Ende hinausgehen
+            
+            # Velocity berücksichtigen (0-127 -> 0.0-1.0)
+            velocity_factor = msg.velocity / 127.0
+            audio[start:end] += sample * velocity_factor
+            events_processed += 1
+
+    print(f"[INFO] Verarbeitete Events: {events_processed}")
+    
+    if events_processed == 0:
+        print("[WARN] Keine MIDI-Events gefunden!")
+        return False
+
+    # Clipping vermeiden
+    audio = np.clip(audio, -1.0, 1.0)
+
+    print(f"[INFO] Schreibe Output: {output_wav}")
+    sf.write(output_wav, audio, SAMPLE_RATE)
+    print("[INFO] Fertig!")
+    return True
+
+def batch_render_kicks(midi_file, sample_dir, output_prefix):
+    """Rendert für jede Kick-Variante eine eigene WAV-Datei."""
+    # Finde alle Kick-Samples
+    kick_samples = []
+    for f in os.listdir(sample_dir):
+        if f.lower().endswith('.wav') and 'kick' in f.lower():
+            kick_samples.append(f)
+    if not kick_samples:
+        print("[ERROR] Keine Kick-Samples gefunden!")
+        return
+    print(f"[INFO] Gefundene Kick-Samples: {kick_samples}")
+
+    # Für jede Kick-Variante eine WAV-Datei erzeugen
+    for kick_file in kick_samples:
+        print(f"[BATCH] Verwende Kick: {kick_file}")
+        # Temporäres Mapping: alle anderen Drums wie gehabt, Kick ersetzt
+        note_to_sample = auto_map_samples(sample_dir)
+        # Ersetze Kick-Note (36) durch aktuelle Kick-Variante
+        note_to_sample[36] = os.path.join(sample_dir, kick_file)
+        # Samples laden
+        samples = {}
+        for note, wav_path in note_to_sample.items():
+            sample = load_sample(wav_path)
+            if sample is not None:
+                samples[note] = sample
+        # Output-Dateiname
+        out_wav = f"{output_prefix}_kick_{os.path.splitext(kick_file)[0]}.wav"
+        # MIDI zu Audio
+        mid = mido.MidiFile(midi_file)
+        total_duration = mid.length
+        total_samples = int(SAMPLE_RATE * total_duration) + SAMPLE_RATE
+        audio = np.zeros((total_samples, 2), dtype=np.float32)
+        time = 0.0
+        for msg in mid:
+            time += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0 and msg.note in samples:
+                sample = samples[msg.note]
+                start = int(time * SAMPLE_RATE)
+                end = start + len(sample)
+                if end > len(audio):
+                    continue
+                velocity_factor = msg.velocity / 127.0
+                audio[start:end] += sample * velocity_factor
+        audio = np.clip(audio, -1.0, 1.0)
+        sf.write(out_wav, audio, SAMPLE_RATE)
+        print(f"[BATCH] Exportiert: {out_wav}")
+
+# === CLI-Aufruf erweitert ===
+if __name__ == "__main__":
+    if len(sys.argv) == 5 and sys.argv[1] == '--batch-kick':
+        # Beispiel: python3 script --batch-kick funky_drum_pattern.mid "2 Funk Kit Samples/" output
+        batch_render_kicks(sys.argv[2], sys.argv[3], sys.argv[4])
+        sys.exit(0)
+    if len(sys.argv) != 4:
+        print("Nutzung: python3 script <input.mid> <sample_ordner/> <output.wav>")
+        print("Oder:    python3 script --batch-kick <input.mid> <sample_ordner/> <output_prefix>")
+        sys.exit(1)
+    success = midi_to_audio(sys.argv[1], sys.argv[2], sys.argv[3])
+    if not success:
+        sys.exit(1)
